@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# W&B — all generated folders
+wandb/
+notebooks/wandb/
+*.wandb
+
+# Model weights — too large for GitHub
+models/
+
+# Environment
+.env
