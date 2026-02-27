@@ -11,30 +11,40 @@ from .objective_functions import get_loss
 class NeuralNetwork:
     """
     Main model class that orchestrates the neural network training and inference.
-
-    Parameters
-    ----------
-    input_size   : int       – number of input features (784 for MNIST)
-    hidden_sizes : list[int] – neurons per hidden layer e.g. [128, 128, 128]
-    num_classes  : int       – output neurons (10 for MNIST/Fashion-MNIST)
-    activation   : str       – hidden layer activation: 'sigmoid'|'tanh'|'relu'
-    weight_init  : str       – 'random' | 'xavier'
-    loss         : str       – 'cross_entropy' | 'mse'
     """
 
-    def __init__(self, input_size: int, hidden_sizes: list,
-                 num_classes: int = 10, activation: str = "relu",
-                 weight_init: str = "xavier", loss: str = "cross_entropy"):
+    def __init__(self, cli_args):
+        """
+        Initialize the neural network from CLI arguments.
 
-        self.input_size   = input_size
-        self.hidden_sizes = hidden_sizes
-        self.num_classes  = num_classes
-        self.activation   = activation
-        self.weight_init  = weight_init
-        self.loss_name    = loss
+        Args:
+            cli_args: argparse Namespace with all config parameters
+        """
+        self.cli_args = cli_args
 
-        self.loss_fn, self.loss_grad = get_loss(loss)
+        # resolve hidden sizes
+        if len(cli_args.hidden_size) == 1:
+            self.hidden_sizes = [cli_args.hidden_size[0]] * cli_args.num_layers
+        elif len(cli_args.hidden_size) == cli_args.num_layers:
+            self.hidden_sizes = cli_args.hidden_size
+        else:
+            raise ValueError(
+                f"--hidden_size must have 1 value or exactly "
+                f"{cli_args.num_layers} values."
+            )
+
+        self.input_size  = 784
+        self.num_classes = 10
+        self.activation  = cli_args.activation
+        self.weight_init = cli_args.weight_init
+        self.loss_name   = cli_args.loss
+
+        self.loss_fn, self.loss_grad = get_loss(cli_args.loss)
         self.layers = self._build_layers()
+
+        # gradient storage — exposed for autograder
+        self.grad_W = None
+        self.grad_b = None
 
     # ── architecture ──────────────────────────────────────────────────────────
     def _build_layers(self):
@@ -43,7 +53,8 @@ class NeuralNetwork:
 
         for i in range(len(sizes) - 1):
             is_output = (i == len(sizes) - 2)
-            act = "softmax" if is_output else self.activation
+            # output layer has NO activation — returns logits
+            act = "none" if is_output else self.activation
             layers.append(
                 NeuralLayer(
                     in_features  = sizes[i],
@@ -58,75 +69,87 @@ class NeuralNetwork:
     def forward(self, X: np.ndarray) -> np.ndarray:
         """
         Forward propagation through all layers.
-
-        Args:
-            X : (batch_size, input_size)
-
-        Returns:
-            softmax probabilities : (batch_size, num_classes)
+        Returns logits (linear combination, no softmax applied).
+        X shape: (batch_size, input_size)
+        Output shape: (batch_size, num_classes)
         """
         A = X
         for layer in self.layers:
             A = layer.forward(A)
-        return A
+        return A   # raw logits
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Returns softmax probabilities for evaluation."""
+        from .activations import softmax
+        logits = self.forward(X)
+        return softmax(logits)
 
     # ── backward pass ─────────────────────────────────────────────────────────
     def backward(self, y_true: np.ndarray, y_pred: np.ndarray,
-                 weight_decay: float = 0.0):
-        """
-        Backward propagation to compute and store gradients in every layer.
+             weight_decay: float = 0.0):
+        from .activations import softmax
 
-        Args:
-            y_true       : (batch, num_classes) – one-hot targets
-            y_pred       : (batch, num_classes) – network output (softmax probs)
-            weight_decay : L2 regularisation coefficient
+        # apply softmax to logits to get probs
+        probs = softmax(y_pred)
 
-        Returns:
-            grad_W, grad_b of the FIRST layer (for compatibility)
-        """
-        # upstream gradient: dL/d(probs)
-        dA = self.loss_grad(y_pred, y_true)
+        # combined softmax + CE gradient = (probs - y_true) / batch_size
+        # pass this directly as dZ to output layer (bypassing activation grad)
+        batch_size = y_true.shape[0]
+        dZ = (probs - y_true)
 
-        for layer in reversed(self.layers):
+        grad_W_list = []
+        grad_b_list = []
+
+        ## output layer gradients
+        output_layer = self.layers[-1]
+        output_layer.grad_W = (output_layer.A_prev.T @ dZ) / batch_size
+        output_layer.grad_b = np.mean(dZ, axis=0, keepdims=True)
+        grad_W_list.append(output_layer.grad_W)
+        grad_b_list.append(output_layer.grad_b)
+
+        # propagate to previous layers — dA is unnormalised
+        dA = dZ @ output_layer.W.T
+
+        for layer in reversed(self.layers[:-1]):
             dA = layer.backward(dA, weight_decay=weight_decay)
+            grad_W_list.append(layer.grad_W)
+            grad_b_list.append(layer.grad_b)
 
-        return self.layers[0].grad_W, self.layers[0].grad_b
+        # store as object arrays — index 0 = last layer
+        self.grad_W = np.empty(len(grad_W_list), dtype=object)
+        self.grad_b = np.empty(len(grad_b_list), dtype=object)
+        for i, (gw, gb) in enumerate(zip(grad_W_list, grad_b_list)):
+            self.grad_W[i] = gw
+            self.grad_b[i] = gb
+
+        return self.grad_W, self.grad_b
 
     # ── weight update ──────────────────────────────────────────────────────────
     def update_weights(self, optimizer):
-        """
-        Update weights using the optimizer.
-
-        Args:
-            optimizer : any optimizer instance from optimizers.py
-        """
+        """Update weights using the optimizer."""
         if hasattr(optimizer, "step_start"):
             optimizer.step_start()
-
         for layer in self.layers:
             optimizer.update(layer)
 
     # ── loss ──────────────────────────────────────────────────────────────────
-    def compute_loss(self, y_pred: np.ndarray, y_true: np.ndarray,
+    def compute_loss(self, logits: np.ndarray, y_true: np.ndarray,
                      weight_decay: float = 0.0) -> float:
-        """Returns scalar loss + optional L2 regularisation term."""
-        data_loss = self.loss_fn(y_pred, y_true)
+        """Compute loss from logits (applies softmax internally)."""
+        from .activations import softmax
+        probs     = softmax(logits)
+        data_loss = self.loss_fn(probs, y_true)
         if weight_decay > 0:
             l2 = sum(np.sum(layer.W ** 2) for layer in self.layers)
             data_loss += 0.5 * weight_decay * l2
         return data_loss
 
     # ── train ─────────────────────────────────────────────────────────────────
-    def train(self, X_train, y_train, epochs, batch_size,
-              optimizer, X_val=None, y_val=None,
+    def train(self, X_train, y_train, epochs=1, batch_size=32,
+              optimizer=None, X_val=None, y_val=None,
               weight_decay=0.0, wandb_log=False):
-        """
-        Train the network for specified epochs.
-
-        Returns:
-            history dict with train_loss, train_acc, val_loss, val_acc per epoch
-        """
-        from src.utils.data_loader import get_batches
+        """Train the network."""
+        from utils.data_loader import get_batches
 
         history = {
             "train_loss": [], "train_acc": [],
@@ -138,13 +161,12 @@ class NeuralNetwork:
             n_batches  = 0
 
             for X_batch, y_batch in get_batches(X_train, y_train, batch_size):
-                y_pred = self.forward(X_batch)
-                epoch_loss += self.compute_loss(y_pred, y_batch, weight_decay)
-                self.backward(y_batch, y_pred, weight_decay)
+                logits = self.forward(X_batch)
+                epoch_loss += self.compute_loss(logits, y_batch, weight_decay)
+                self.backward(y_batch, logits, weight_decay)
                 self.update_weights(optimizer)
                 n_batches += 1
 
-            # ── epoch metrics ─────────────────────────────────────────────────
             train_loss = epoch_loss / n_batches
             train_acc  = self.evaluate(X_train, y_train)
 
@@ -152,20 +174,17 @@ class NeuralNetwork:
             history["train_acc"].append(train_acc)
 
             log_dict = {
-                "epoch":      epoch,
-                "train_loss": train_loss,
-                "train_acc":  train_acc,
+                "epoch": epoch, "train_loss": train_loss, "train_acc": train_acc
             }
 
             if X_val is not None:
-                val_pred = self.forward(X_val)
-                val_loss = self.compute_loss(val_pred, y_val, weight_decay)
-                val_acc  = self.evaluate(X_val, y_val)
+                val_logits = self.forward(X_val)
+                val_loss   = self.compute_loss(val_logits, y_val, weight_decay)
+                val_acc    = self.evaluate(X_val, y_val)
                 history["val_loss"].append(val_loss)
                 history["val_acc"].append(val_acc)
                 log_dict["val_loss"] = val_loss
                 log_dict["val_acc"]  = val_acc
-
                 print(
                     f"Epoch [{epoch:>3}/{epochs}]  "
                     f"train_loss={train_loss:.4f}  train_acc={train_acc:.4f}  "
@@ -188,57 +207,49 @@ class NeuralNetwork:
 
     # ── evaluate ──────────────────────────────────────────────────────────────
     def evaluate(self, X: np.ndarray, y: np.ndarray) -> float:
-        """
-        Evaluate accuracy on given data.
-
-        Args:
-            X : input features
-            y : one-hot labels
-
-        Returns:
-            accuracy as a float between 0 and 1
-        """
-        probs  = self.forward(X)
-        preds  = np.argmax(probs,  axis=1)
-        labels = np.argmax(y,      axis=1)
+        """Returns accuracy."""
+        probs  = self.predict_proba(X)
+        preds  = np.argmax(probs, axis=1)
+        labels = np.argmax(y,     axis=1)
         return float(np.mean(preds == labels))
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Return predicted class indices."""
-        return np.argmax(self.forward(X), axis=1)
+        return np.argmax(self.predict_proba(X), axis=1)
 
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return softmax probabilities."""
-        return self.forward(X)
+    # ── get / set weights ─────────────────────────────────────────────────────
+    def get_weights(self):
+        """Return all weights as a dict."""
+        d = {}
+        for i, layer in enumerate(self.layers):
+            d[f"W{i}"] = layer.W.copy()
+            d[f"b{i}"] = layer.b.copy()
+        return d
+
+    def set_weights(self, weight_dict: dict):
+        """Load weights from a dict."""
+        for i, layer in enumerate(self.layers):
+            if f"W{i}" in weight_dict:
+                layer.W = weight_dict[f"W{i}"].copy()
+            if f"b{i}" in weight_dict:
+                layer.b = weight_dict[f"b{i}"].copy()
 
     # ── save / load ───────────────────────────────────────────────────────────
     def save(self, path: str):
-        """Save all layer weights to a single .npy file."""
-        params = {}
-        for i, layer in enumerate(self.layers):
-            params[f"layer_{i}_W"] = layer.W
-            params[f"layer_{i}_b"] = layer.b
-        np.save(path, params)
+        """Save weights to .npy file."""
+        np.save(path, self.get_weights())
         print(f"[Model] Saved → {path}")
 
     def load(self, path: str):
-        """Load weights from a .npy file produced by save()."""
-        params = np.load(path, allow_pickle=True).item()
-        for i, layer in enumerate(self.layers):
-            layer.W = params[f"layer_{i}_W"]
-            layer.b = params[f"layer_{i}_b"]
+        """Load weights from .npy file."""
+        data = np.load(path, allow_pickle=True).item()
+        self.set_weights(data)
         print(f"[Model] Loaded ← {path}")
 
-    # ── gradient check (autograder Q1.2) ─────────────────────────────────────
-    def numerical_gradients(self, X: np.ndarray, y_true: np.ndarray,
-                             weight_decay: float = 0.0, eps: float = 1e-5):
-        """
-        Central-difference numerical gradients for verifying backward().
-        Returns list of dicts [{"W": ..., "b": ...}] for each layer.
-        Tolerance required by autograder: 1e-7
-        """
+    # ── numerical gradient check ──────────────────────────────────────────────
+    def numerical_gradients(self, X, y_true, weight_decay=0.0, eps=1e-5):
+        """Central difference numerical gradients for gradient checking."""
         num_grads = []
-
         for layer in self.layers:
             dW = np.zeros_like(layer.W)
             db = np.zeros_like(layer.b)
@@ -268,5 +279,4 @@ class NeuralNetwork:
                 it.iternext()
 
             num_grads.append({"W": dW, "b": db})
-
         return num_grads

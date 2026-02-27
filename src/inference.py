@@ -21,21 +21,52 @@ from utils import load_dataset
 # ── argument parser ────────────────────────────────────────────────────────────
 
 def parse_arguments():
-    """Parse command-line arguments for inference."""
     parser = argparse.ArgumentParser(description="Run inference on test set")
 
+    # W&B
+    parser.add_argument("-wp", "--wandb_project",
+                        type=str, default="da6401_assignment_1")
+    parser.add_argument("-we", "--wandb_entity",
+                        type=str, default=None)
+
+    # dataset
+    parser.add_argument("-d",  "--dataset",
+                        type=str, default="mnist",
+                        choices=["mnist", "fashion_mnist"])
+
+    # architecture — same defaults as best model
+    parser.add_argument("-nhl", "--num_layers",
+                        type=int, default=3)
+    parser.add_argument("-sz",  "--hidden_size",
+                        type=int, nargs="+", default=[128])
+    parser.add_argument("-a",   "--activation",
+                        type=str, default="relu",
+                        choices=["sigmoid", "tanh", "relu"])
+    parser.add_argument("-wi",  "--weight_init",
+                        type=str, default="xavier",
+                        choices=["random", "xavier"])
+    parser.add_argument("-l",   "--loss",
+                        type=str, default="cross_entropy",
+                        choices=["cross_entropy", "mse"])
+    parser.add_argument("-o",   "--optimizer",
+                        type=str, default="adam",
+                        choices=["sgd", "momentum", "nag",
+                                 "rmsprop", "adam", "nadam"])
+    parser.add_argument("-lr",  "--learning_rate",
+                        type=float, default=0.001)
+    parser.add_argument("-wd",  "--weight_decay",
+                        type=float, default=0.0)
+    parser.add_argument("-e",   "--epochs",
+                        type=int, default=15)
+    parser.add_argument("-b",   "--batch_size",
+                        type=int, default=64)
+
+    # paths
     parser.add_argument("--model_path",
                         type=str, default="models/best_model.npy",
                         help="Relative path to saved model weights")
     parser.add_argument("--config_path",
                         type=str, default="models/best_config.json")
-    parser.add_argument("-d", "--dataset",
-                        type=str, default=None,
-                        help="Override dataset from config (mnist | fashion_mnist)")
-    parser.add_argument("--wandb_project",
-                        type=str, default="da6401_assignment_1")
-    parser.add_argument("--wandb_entity",
-                        type=str, default=None)
     parser.add_argument("--no_wandb",
                         action="store_true")
 
@@ -44,27 +75,10 @@ def parse_arguments():
 
 # ── load model ─────────────────────────────────────────────────────────────────
 
-def load_model(model_path, config_path):
-    """
-    Load trained model from disk.
-    Rebuilds architecture from config then loads weights.
-    """
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config not found: {config_path}")
-
-    with open(config_path) as f:
-        cfg = json.load(f)
-
-    model = NeuralNetwork(
-        input_size   = 784,
-        hidden_sizes = cfg["hidden_sizes"],
-        num_classes  = 10,
-        activation   = cfg.get("activation",  "relu"),
-        weight_init  = cfg.get("weight_init", "xavier"),
-        loss         = cfg.get("loss",        "cross_entropy"),
-    )
-    model.load(model_path)
-    return model, cfg
+def load_model(model_path):
+    """Load trained model weights from disk."""
+    data = np.load(model_path, allow_pickle=True).item()
+    return data
 
 
 # ── evaluate model ─────────────────────────────────────────────────────────────
@@ -77,15 +91,12 @@ def evaluate_model(model, X_test, y_test):
     -------
     dict with keys: logits, loss, accuracy, f1, precision, recall
     """
-    # forward pass
+    logits     = model.forward(X_test)
     probs      = model.predict_proba(X_test)
-    y_pred_int = np.argmax(probs,   axis=1)
-    y_true_int = np.argmax(y_test,  axis=1)
+    y_pred_int = np.argmax(probs,  axis=1)
+    y_true_int = np.argmax(y_test, axis=1)
 
-    # loss
-    loss = model.compute_loss(probs, y_test)
-
-    # metrics
+    loss      = model.compute_loss(logits, y_test)
     accuracy  = accuracy_score (y_true_int, y_pred_int)
     precision = precision_score(y_true_int, y_pred_int,
                                 average="macro", zero_division=0)
@@ -95,7 +106,7 @@ def evaluate_model(model, X_test, y_test):
                                 average="macro", zero_division=0)
 
     return {
-        "logits":    probs,
+        "logits":    logits,
         "loss":      loss,
         "accuracy":  accuracy,
         "precision": precision,
@@ -113,18 +124,30 @@ def main():
     """
     args = parse_arguments()
 
+    # override args from config file if it exists
+    if os.path.exists(args.config_path):
+        with open(args.config_path) as f:
+            cfg = json.load(f)
+        args.num_layers   = cfg.get("num_layers",    args.num_layers)
+        args.hidden_size  = cfg.get("hidden_size",   args.hidden_size)
+        args.activation   = cfg.get("activation",    args.activation)
+        args.weight_init  = cfg.get("weight_init",   args.weight_init)
+        args.loss         = cfg.get("loss",          args.loss)
+        args.dataset      = cfg.get("dataset",       args.dataset)
+
     # ── load model ────────────────────────────────────────────────────────────
-    model, cfg = load_model(args.model_path, args.config_path)
+    model   = NeuralNetwork(args)
+    weights = load_model(args.model_path)
+    model.set_weights(weights)
 
     # ── load data ─────────────────────────────────────────────────────────────
-    dataset = args.dataset or cfg.get("dataset", "mnist")
-    _, _, _, _, X_test, y_test = load_dataset(dataset)
+    _, _, _, _, X_test, y_test = load_dataset(args.dataset)
 
     # ── evaluate ──────────────────────────────────────────────────────────────
     results = evaluate_model(model, X_test, y_test)
 
     print(f"\n{'='*50}")
-    print(f"  EVALUATION RESULTS — {dataset.upper()}")
+    print(f"  EVALUATION RESULTS — {args.dataset.upper()}")
     print(f"{'='*50}")
     print(f"  Accuracy  : {results['accuracy']:.4f}")
     print(f"  Precision : {results['precision']:.4f}")

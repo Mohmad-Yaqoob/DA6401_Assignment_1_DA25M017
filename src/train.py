@@ -8,11 +8,12 @@ import json
 import os
 import sys
 import numpy as np
+from sklearn.metrics import f1_score
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ann import NeuralNetwork, get_optimizer
-from utils import load_dataset
+from utils import load_dataset, get_batches
 
 try:
     import wandb
@@ -25,8 +26,9 @@ except ImportError:
 # ── argument parser ────────────────────────────────────────────────────────────
 
 def parse_arguments():
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="Train a neural network on MNIST / Fashion-MNIST")
+    parser = argparse.ArgumentParser(
+        description="Train a neural network on MNIST / Fashion-MNIST"
+    )
 
     # W&B
     parser.add_argument("-wp", "--wandb_project",
@@ -39,7 +41,7 @@ def parse_arguments():
                         type=str, default="mnist",
                         choices=["mnist", "fashion_mnist"])
     parser.add_argument("-e",   "--epochs",
-                        type=int, default=10)
+                        type=int, default=15)
     parser.add_argument("-b",   "--batch_size",
                         type=int, default=64)
     parser.add_argument("-l",   "--loss",
@@ -55,15 +57,13 @@ def parse_arguments():
     parser.add_argument("-wd",  "--weight_decay",
                         type=float, default=0.0)
 
-    # architecture
+    # architecture — best config as defaults
     parser.add_argument("-nhl", "--num_layers",
-                        type=int, default=3,
-                        help="Number of hidden layers")
+                        type=int, default=3)
     parser.add_argument("-sz",  "--hidden_size",
                         type=int, nargs="+", default=[128],
                         help="Neurons per hidden layer. "
-                             "One value = same for all layers. "
-                             "Or pass one value per layer.")
+                             "One value = same for all layers.")
     parser.add_argument("-a",   "--activation",
                         type=str, default="relu",
                         choices=["sigmoid", "tanh", "relu"])
@@ -72,32 +72,12 @@ def parse_arguments():
                         choices=["random", "xavier"])
 
     # misc
-    parser.add_argument("--val_split",   type=float, default=0.1)
-    parser.add_argument("--seed",        type=int,   default=42)
-    parser.add_argument("--save_dir",    type=str,   default="models",
-                        help="Relative path to save best model weights")
-    parser.add_argument("--no_wandb",    action="store_true",
-                        help="Disable W&B logging entirely")
+    parser.add_argument("--val_split",  type=float, default=0.1)
+    parser.add_argument("--seed",       type=int,   default=42)
+    parser.add_argument("--save_dir",   type=str,   default="models")
+    parser.add_argument("--no_wandb",   action="store_true")
 
     return parser.parse_args()
-
-
-# ── helpers ────────────────────────────────────────────────────────────────────
-
-def resolve_hidden_sizes(hidden_size: list, num_layers: int) -> list:
-    """
-    If one value given → broadcast to all layers.
-    If num_layers values given → use as-is.
-    """
-    if len(hidden_size) == 1:
-        return [hidden_size[0]] * num_layers
-    elif len(hidden_size) == num_layers:
-        return hidden_size
-    else:
-        raise ValueError(
-            f"--hidden_size must have 1 value (broadcast) "
-            f"or exactly {num_layers} values, got {len(hidden_size)}."
-        )
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
@@ -106,25 +86,21 @@ def main():
     args = parse_arguments()
     np.random.seed(args.seed)
 
-    # resolve architecture
-    hidden_sizes = resolve_hidden_sizes(args.hidden_size, args.num_layers)
-
-    # assignment limits
-    assert args.num_layers <= 6,       "Keep num_layers ≤ 6"
-    assert max(hidden_sizes) <= 128,   "Keep hidden neurons per layer ≤ 128"
-
     # ── W&B ──────────────────────────────────────────────────────────────────
     use_wandb = WANDB_AVAILABLE and not args.no_wandb
-    config    = {**vars(args), "hidden_sizes": hidden_sizes}
 
     if use_wandb:
         wandb.init(
             project = args.wandb_project,
             entity  = args.wandb_entity,
-            config  = config,
+            config  = vars(args),
         )
 
-    # ── print run summary ────────────────────────────────────────────────────
+    # ── print summary ────────────────────────────────────────────────────────
+    hidden_sizes = ([args.hidden_size[0]] * args.num_layers
+                    if len(args.hidden_size) == 1
+                    else args.hidden_size)
+
     print(f"\n{'='*60}")
     print(f"  Dataset    : {args.dataset.upper()}")
     print(f"  Hidden     : {hidden_sizes}")
@@ -141,14 +117,7 @@ def main():
     )
 
     # ── model ────────────────────────────────────────────────────────────────
-    model = NeuralNetwork(
-        input_size   = X_train.shape[1],
-        hidden_sizes = hidden_sizes,
-        num_classes  = 10,
-        activation   = args.activation,
-        weight_init  = args.weight_init,
-        loss         = args.loss,
-    )
+    model = NeuralNetwork(args)
 
     # ── optimizer ────────────────────────────────────────────────────────────
     optimizer = get_optimizer(
@@ -159,52 +128,63 @@ def main():
 
     # ── training loop ────────────────────────────────────────────────────────
     os.makedirs(args.save_dir, exist_ok=True)
-    best_val_acc = 0.0
-
-    from utils import get_batches
+    best_f1      = 0.0
+    best_weights = None
 
     for epoch in range(1, args.epochs + 1):
         epoch_loss = 0.0
         n_batches  = 0
 
         for X_batch, y_batch in get_batches(X_train, y_train, args.batch_size):
-            y_pred = model.forward(X_batch)
-            epoch_loss += model.compute_loss(y_pred, y_batch, args.weight_decay)
-            model.backward(y_batch, y_pred, args.weight_decay)
+            logits = model.forward(X_batch)
+            epoch_loss += model.compute_loss(logits, y_batch, args.weight_decay)
+            model.backward(y_batch, logits, args.weight_decay)
             model.update_weights(optimizer)
             n_batches += 1
 
         # ── epoch metrics ────────────────────────────────────────────────────
         train_loss = epoch_loss / n_batches
-        train_acc  = model.evaluate(X_train, y_train)
 
-        val_pred   = model.forward(X_val)
-        val_loss   = model.compute_loss(val_pred, y_val, args.weight_decay)
+        val_logits = model.forward(X_val)
+        val_loss   = model.compute_loss(val_logits, y_val, args.weight_decay)
         val_acc    = model.evaluate(X_val, y_val)
+
+        # F1 score on validation
+        val_preds  = model.predict(X_val)
+        val_true   = np.argmax(y_val, axis=1)
+        val_f1     = f1_score(val_true, val_preds, average="macro",
+                              zero_division=0)
 
         print(
             f"Epoch [{epoch:>3}/{args.epochs}]  "
-            f"train_loss={train_loss:.4f}  train_acc={train_acc:.4f}  "
-            f"val_loss={val_loss:.4f}  val_acc={val_acc:.4f}"
+            f"train_loss={train_loss:.4f}  "
+            f"val_loss={val_loss:.4f}  "
+            f"val_acc={val_acc:.4f}  "
+            f"val_f1={val_f1:.4f}"
         )
 
         if use_wandb:
             wandb.log({
                 "epoch":      epoch,
                 "train_loss": train_loss,
-                "train_acc":  train_acc,
                 "val_loss":   val_loss,
                 "val_acc":    val_acc,
+                "val_f1":     val_f1,
             })
 
-        # ── save best model ──────────────────────────────────────────────────
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            model.save(os.path.join(args.save_dir, "best_model.npy"))
+        # ── save best model based on F1 score ────────────────────────────────
+        if val_f1 > best_f1:
+            best_f1      = val_f1
+            best_weights = model.get_weights()
+
+            np.save(os.path.join(args.save_dir, "best_model.npy"),
+                    best_weights)
 
             best_config = {
                 "dataset":       args.dataset,
                 "hidden_sizes":  hidden_sizes,
+                "hidden_size":   hidden_sizes,
+                "num_layers":    args.num_layers,
                 "activation":    args.activation,
                 "weight_init":   args.weight_init,
                 "loss":          args.loss,
@@ -213,24 +193,35 @@ def main():
                 "weight_decay":  args.weight_decay,
                 "batch_size":    args.batch_size,
                 "epochs":        args.epochs,
-                "best_val_acc":  best_val_acc,
+                "best_val_f1":   best_f1,
             }
             with open(os.path.join(args.save_dir, "best_config.json"), "w") as f:
                 json.dump(best_config, f, indent=2)
 
     # ── final test evaluation ─────────────────────────────────────────────────
-    model.load(os.path.join(args.save_dir, "best_model.npy"))
-    test_acc  = model.evaluate(X_test, y_test)
-    test_pred = model.forward(X_test)
-    test_loss = model.compute_loss(test_pred, y_test)
+    # load best weights
+    model.set_weights(best_weights)
+
+    test_logits = model.forward(X_test)
+    test_loss   = model.compute_loss(test_logits, y_test)
+    test_acc    = model.evaluate(X_test, y_test)
+    test_preds  = model.predict(X_test)
+    test_true   = np.argmax(y_test, axis=1)
+    test_f1     = f1_score(test_true, test_preds, average="macro",
+                           zero_division=0)
 
     print(f"\n{'='*60}")
     print(f"  Final Test Acc  : {test_acc:.4f}")
+    print(f"  Final Test F1   : {test_f1:.4f}")
     print(f"  Final Test Loss : {test_loss:.4f}")
     print(f"{'='*60}\n")
 
     if use_wandb:
-        wandb.log({"test_acc": test_acc, "test_loss": test_loss})
+        wandb.log({
+            "test_acc":  test_acc,
+            "test_f1":   test_f1,
+            "test_loss": test_loss,
+        })
         wandb.finish()
 
     print("Training complete!")
