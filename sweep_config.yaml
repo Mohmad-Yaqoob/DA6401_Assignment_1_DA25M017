@@ -1,0 +1,41 @@
+program: src/train.py
+method: bayes
+metric:
+  name: val_acc
+  goal: maximize
+
+parameters:
+  dataset:
+    value: mnist
+
+  epochs:
+    value: 10
+
+  batch_size:
+    values: [32, 64, 128]
+
+  loss:
+    values: [cross_entropy, mse]
+
+  optimizer:
+    values: [sgd, momentum, nag, rmsprop, adam, nadam]
+
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.1
+
+  weight_decay:
+    values: [0.0, 0.0005, 0.001]
+
+  num_layers:
+    values: [2, 3, 4, 5]
+
+  hidden_size:
+    values: [32, 64, 128]
+
+  activation:
+    values: [sigmoid, tanh, relu]
+
+  weight_init:
+    values: [random, xavier]

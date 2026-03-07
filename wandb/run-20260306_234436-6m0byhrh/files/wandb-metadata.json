@@ -1,0 +1,24 @@
+{
+  "os":  "Windows-10-10.0.26200-SP0",
+  "python":  "CPython 3.10.18",
+  "startedAt":  "2026-03-06T18:14:36.599653Z",
+  "program":  "D:\\IIT Madras\\2nd Mtech\\DL\\Assignments\\395380985\\src\\train.py",
+  "codePath":  "src\\train.py",
+  "codePathLocal":  "src\\train.py",
+  "email":  "da25m017@smail.iitm.ac.in",
+  "root":  "D:\\IIT Madras\\2nd Mtech\\DL\\Assignments\\395380985",
+  "host":  "yaqoob",
+  "executable":  "D:\\Conda\\envs\\myenv\\python.exe",
+  "cpu_count":  4,
+  "cpu_count_logical":  8,
+  "disk":  {
+    "/":  {
+      "total":  "247462883328",
+      "used":  "52276924416"
+    }
+  },
+  "memory":  {
+    "total":  "16907886592"
+  },
+  "writerId":  "feyg7t2zeug9zfba9djkz7uiuorvuyj8"
+}
